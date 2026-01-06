@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"tg_market/internal/domain/entity"
@@ -17,46 +18,78 @@ type MarketScanner struct {
 	giftService  *service.GiftService
 	giftTypeRepo GiftTypeRepository
 	deals        chan<- service.GoodDeal
-	interval     time.Duration
 	giftTypeIDs  []int64
+
+	// Rate control
+	requestInterval time.Duration // интервал между запросами (gap)
+	lastRequest     time.Time
 }
 
 func NewMarketScanner(
 	giftService *service.GiftService,
 	giftTypeRepo GiftTypeRepository,
 	deals chan<- service.GoodDeal,
-	interval time.Duration,
 ) *MarketScanner {
 	return &MarketScanner{
-		giftService:  giftService,
-		giftTypeRepo: giftTypeRepo,
-		deals:        deals,
-		interval:     interval,
+		giftService:     giftService,
+		giftTypeRepo:    giftTypeRepo,
+		deals:           deals,
+		requestInterval: 750 * time.Millisecond, // дефолт
 	}
 }
 
-// WithGiftTypes ограничивает сканирование конкретными типами.
 func (w *MarketScanner) WithGiftTypes(ids ...int64) *MarketScanner {
 	w.giftTypeIDs = ids
 	return w
 }
 
+// WithRateControl устанавливает интервал между запросами.
+// Для 2 клиентов и ratePerClient=1500ms → interval=750ms.
+func (w *MarketScanner) WithRateControl(ratePerClient time.Duration, clientCount int) *MarketScanner {
+	if clientCount > 0 {
+		w.requestInterval = ratePerClient / time.Duration(clientCount)
+	}
+	return w
+}
+
 func (w *MarketScanner) Run(ctx context.Context) error {
-	logger(ctx).Info("market scanner started", "interval", w.interval, "types", w.giftTypeIDs)
-
-	w.scanAll(ctx)
-
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
+	logger(ctx).Info("market scanner started",
+		"types", w.giftTypeIDs,
+		"request_interval", w.requestInterval,
+	)
 
 	for {
 		select {
 		case <-ctx.Done():
 			logger(ctx).Info("market scanner stopped")
 			return ctx.Err()
-		case <-ticker.C:
+		default:
 			w.scanAll(ctx)
 		}
+	}
+}
+
+// waitForNextSlot ждёт до следующего слота для запроса.
+func (w *MarketScanner) waitForNextSlot(ctx context.Context) error {
+	if w.lastRequest.IsZero() {
+		w.lastRequest = time.Now()
+		return nil
+	}
+
+	elapsed := time.Since(w.lastRequest)
+	if elapsed >= w.requestInterval {
+		w.lastRequest = time.Now()
+		return nil
+	}
+
+	wait := w.requestInterval - elapsed
+
+	select {
+	case <-time.After(wait):
+		w.lastRequest = time.Now()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -66,8 +99,6 @@ func (w *MarketScanner) scanAll(ctx context.Context) {
 		logger(ctx).Error("failed to get gift types", "error", err)
 		return
 	}
-
-	logger(ctx).Debug("scanning market", "types_count", len(giftTypes))
 
 	var dealsFound int
 
@@ -85,16 +116,14 @@ func (w *MarketScanner) scanAll(ctx context.Context) {
 		}
 
 		dealsFound += count
-		time.Sleep(500 * time.Millisecond)
 	}
 
 	if dealsFound > 0 {
-		logger(ctx).Info("scan completed", "deals_found", dealsFound)
+		logger(ctx).Info("scan cycle completed", "deals_found", dealsFound)
 	}
 }
 
 func (w *MarketScanner) getGiftTypes(ctx context.Context) ([]entity.GiftType, error) {
-	// Если указаны конкретные типы — загружаем только их
 	if len(w.giftTypeIDs) > 0 {
 		var result []entity.GiftType
 		for _, id := range w.giftTypeIDs {
@@ -107,11 +136,17 @@ func (w *MarketScanner) getGiftTypes(ctx context.Context) ([]entity.GiftType, er
 		return result, nil
 	}
 
-	// Иначе — все
 	return w.giftTypeRepo.List(ctx, 100, 0)
 }
 
 func (w *MarketScanner) scanOne(ctx context.Context, giftType *entity.GiftType) (int, error) {
+	// Ждём слот перед GetGiftAveragePrice
+	if err := w.waitForNextSlot(ctx); err != nil {
+		return 0, err
+	}
+
+	now := time.Now()
+	fmt.Printf("[%s] 🔍 Scan %s\n", now.Format("15:04:05.000"), giftType.Name)
 
 	avgPrice, err := w.giftService.GetGiftAveragePrice(ctx, giftType.ID)
 	if err != nil {
@@ -119,6 +154,11 @@ func (w *MarketScanner) scanOne(ctx context.Context, giftType *entity.GiftType) 
 	}
 
 	giftType.AveragePrice = avgPrice
+
+	// Ждём слот перед CheckMarketForType
+	if err := w.waitForNextSlot(ctx); err != nil {
+		return 0, err
+	}
 
 	deals, err := w.giftService.CheckMarketForType(ctx, giftType)
 	if err != nil {

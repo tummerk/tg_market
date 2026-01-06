@@ -4,155 +4,116 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
-	"os/signal"
-	"syscall"
-
-	"git.appkode.ru/pub/go/live/clock"
-	"git.appkode.ru/pub/go/live/xidgenerator"
-	"git.appkode.ru/pub/go/metrics"
-	"git.appkode.ru/pub/go/metrics/field"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/samber/lo"
-	"golang.org/x/sync/errgroup"
-
-	"go-backend-example/internal/config"
-	"go-backend-example/internal/domain/service/example"
-	"go-backend-example/internal/infrastructure/persistence"
-	"go-backend-example/internal/server"
-	"go-backend-example/pkg/application/connectors"
-	"go-backend-example/pkg/application/modules"
-	"go-backend-example/pkg/contextx"
-	"go-backend-example/pkg/logx"
-	"go-backend-example/pkg/middlewarex"
+	"tg_market/internal/config"
+	service "tg_market/internal/domain/service/gift"
+	"tg_market/internal/infrastructure/notifier"
+	"tg_market/internal/infrastructure/persistence"
+	"tg_market/internal/infrastructure/telegram"
+	"tg_market/internal/worker"
+	"tg_market/pkg/application/connectors"
 )
 
-var logger = contextx.LoggerFromContextOrDefault //nolint:gochecknoglobals
-
-type App struct {
-	cfg            config.Config
-	clock          clock.Clock
-	xidGenerator   xidgenerator.Generator
-	metrics        *metrics.Metrics
-	slog           *connectors.Slog
-	postgres       *connectors.Postgres
-	probeServer    modules.ProbeServer
-	metricServer   modules.MetricServer
-	httpServer     modules.HTTPServer
-	exampleService example.Service
-	exampleRepo    persistence.Example
-}
-
-func New(appVersion string) App { //nolint:funlen
-	const appName = "go-backend-example"
-
-	cfg := lo.Must(config.Load())
-
-	return App{
-		cfg: cfg,
-		slog: &connectors.Slog{
-			Name:    appName,
-			Version: appVersion,
-			Debug:   cfg.Debug,
-		},
-		clock:        clock.New(),
-		xidGenerator: xidgenerator.New(),
-		metrics: metrics.NewMetrics(
-			field.NewName(appName),
-			field.NewEmptyName(),
-			field.NewVersion(appVersion),
-		),
-		postgres: &connectors.Postgres{
-			DSN:             cfg.Postgres.DSN,
-			MaxIdleConns:    cfg.Postgres.MaxIdleConns,
-			MaxOpenConns:    cfg.Postgres.MaxOpenConns,
-			ConnMaxLifetime: cfg.Postgres.ConnMaxLifetime,
-		},
-		metricServer: modules.MetricServer{
-			ListenAddress: cfg.Prometheus.ListenAddress,
-		},
-		probeServer: modules.ProbeServer{
-			Name:          appName,
-			Version:       appVersion,
-			ListenAddress: cfg.Probe.ListenAddress,
-		},
-		httpServer: modules.HTTPServer{
-			ShutdownTimeout: cfg.HTTP.ShutdownTimeout,
-		},
-	}
-}
-
-func (app App) shutdown(ctx context.Context) {
-	app.postgres.Close(ctx)
-}
-
-func (app App) Run() error {
-	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		syscall.SIGINT,
-		syscall.SIGTERM,
-	)
-
-	defer stop()
-
-	ctx = contextx.WithLogger(ctx, app.slog.Logger(ctx))
-
-	defer app.shutdown(ctx)
-
-	logger(ctx).Info("config", slog.Any("config", app.cfg))
-
-	app.exampleRepo = persistence.NewExample(app.postgres.Client(ctx))
-	app.exampleService = example.NewService(app.exampleRepo)
-
-	g, ctx := errgroup.WithContext(ctx)
-
-	app.httpServer.Run(ctx, g, app.newHTTPServer(ctx, app.exampleService))
-	app.metricServer.Run(ctx, g)
-	app.probeServer.Run(ctx, g)
-
-	if err := g.Wait(); err != nil {
-		return fmt.Errorf("g.Wait: %w", err)
+func Run(ctx context.Context, log *slog.Logger, cancel context.CancelFunc) error {
+	// 1. Config
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("config load: %w", err)
 	}
 
+	// 2. Database
+	pg := &connectors.Postgres{
+		DSN:             cfg.Postgres.DSN,
+		MaxOpenConns:    cfg.Postgres.MaxOpenConns,
+		MaxIdleConns:    cfg.Postgres.MaxIdleConns,
+		ConnMaxLifetime: cfg.Postgres.ConnMaxLifetime,
+	}
+	db := pg.Client(ctx)
+	defer pg.Close(ctx)
+
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("db ping: %w", err)
+	}
+	log.Info("database connection OK")
+
+	// 3. Repositories
+	giftTypeRepo := persistence.NewGiftTypeRepository(db)
+	giftRepo := persistence.NewGiftRepository(db)
+
+	// 4. Telegram Pool
+	accounts, err := telegram.LoadAccounts("accounts.json")
+	if err != nil {
+		return fmt.Errorf("load accounts: %w", err)
+	}
+	log.Info("loaded accounts", "count", len(accounts))
+
+	pool, err := telegram.NewPool(cfg.Telegram, accounts)
+	if err != nil {
+		return fmt.Errorf("create pool: %w", err)
+	}
+
+	go func() {
+		log.Info("starting telegram pool...")
+		if err := pool.Start(ctx); err != nil && ctx.Err() == nil {
+			log.Error("telegram pool stopped", "error", err)
+			cancel()
+		}
+	}()
+
+	if err := pool.WaitReady(ctx); err != nil {
+		return fmt.Errorf("wait pool ready: %w", err)
+	}
+	log.Info("✅ Telegram Pool Ready", "clients", pool.Size())
+
+	dealsCh := make(chan service.GoodDeal, 100)
+
+	// Notify bot
+
+	alertBot, err := notifier.NewTelegramBot(cfg.Bot.Token, cfg.Bot.ChatID)
+	if err != nil {
+		return fmt.Errorf("notifier bot: %w", err)
+	}
+	log.Info("Testing bot notification...")
+	if err := alertBot.SendText(ctx, "🚀 Bot is starting! Test message."); err != nil {
+		log.Error("❌ Bot test failed! Check Token and ChatID", "err", err)
+	} else {
+		log.Info("✅ Bot test passed! Message sent.")
+	}
+	go func() {
+		log.Info("notifier bot started listening")
+		if err := alertBot.Run(ctx, dealsCh); err != nil {
+			if ctx.Err() == nil {
+				log.Error("notifier bot stopped", "error", err)
+			}
+		}
+	}()
+
+	svc := service.NewGiftService(giftTypeRepo, giftRepo, pool).
+		WithDiscountThreshold(10)
+
+	targetTypes := []int64{
+		6003373314888696650, //candy cane
+		6014591077976114307, //snoop dog
+	}
+
+	scanner := worker.NewMarketScanner(svc, giftTypeRepo, dealsCh).
+		WithGiftTypes(targetTypes...).
+		WithRateControl(cfg.Telegram.GetRatePerClient()/2, pool.Size())
+
+	go func() {
+		defer close(dealsCh)
+
+		if err := scanner.Run(ctx); err != nil {
+			if ctx.Err() == nil {
+				log.Error("scanner died", "err", err)
+				cancel()
+			}
+		}
+	}()
+
+	log.Info("scanner started", "targets", targetTypes)
+
+	<-ctx.Done()
+
+	log.Info("application stopping...")
 	return nil
-}
-
-func (app App) newHTTPServer(ctx context.Context, exampleService example.Service) *http.Server { //nolint:funlen,maintidx
-	router := chi.NewRouter()
-
-	router.Use(
-		middleware.RealIP,
-		middlewarex.TraceID,
-		middlewarex.Logger,
-		middlewarex.RequestLogging(app.newSensitiveDataMasker(), app.cfg.Log.FieldMaxLen),
-		middlewarex.ResponseLogging(app.newSensitiveDataMasker(), app.cfg.Log.FieldMaxLen),
-		middlewarex.Recovery,
-	)
-
-	server.NewServer(
-		server.NewExampleServer(exampleService),
-	).RegisterRoutes(router)
-
-	return &http.Server{
-		//nolint:exhaustruct
-		BaseContext: func(net.Listener) context.Context {
-			return ctx
-		},
-		Addr:              app.cfg.HTTP.ListenAddress,
-		WriteTimeout:      app.cfg.HTTP.WriteTimeout,
-		ReadTimeout:       app.cfg.HTTP.ReadTimeout,
-		ReadHeaderTimeout: app.cfg.HTTP.ReadTimeout,
-		IdleTimeout:       app.cfg.HTTP.IdleTimeout,
-		Handler:           router,
-	}
-}
-
-func (app App) newSensitiveDataMasker() logx.SensitiveDataMaskerInterface { //nolint:ireturn
-	if !app.cfg.Log.SensitiveDataMasker.Enabled {
-		return logx.NewNopSensitiveDataMasker()
-	}
-
-	return logx.NewSensitiveDataMasker()
 }

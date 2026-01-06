@@ -5,15 +5,11 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
-	"go.uber.org/zap"
-
-	"tg_market/internal/config"
 )
 
 // ConsoleInput реализует ввод кода с клавиатуры
@@ -29,36 +25,10 @@ func (c ConsoleInput) Code(ctx context.Context, sentCode *tg.AuthSentCode) (stri
 }
 
 type Client struct {
-	client *telegram.Client
-	api    *tg.Client // raw API
-	cfg    config.Telegram
-}
-
-func NewClient(cfg config.Telegram) (*Client, error) {
-	sessionDir := "storage"
-	if err := os.MkdirAll(sessionDir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create session dir: %w", err)
-	}
-	sessionPath := filepath.Join(sessionDir, "session.json")
-
-	sessionStorage := &telegram.FileSessionStorage{
-		Path: sessionPath,
-	}
-
-	zapLogger, _ := zap.NewProduction()
-
-	opts := telegram.Options{
-		SessionStorage: sessionStorage,
-		Logger:         zapLogger,
-	}
-
-	client := telegram.NewClient(cfg.ApiID, cfg.ApiHash, opts)
-
-	return &Client{
-		client: client,
-		api:    client.API(),
-		cfg:    cfg,
-	}, nil
+	client   *telegram.Client
+	api      *tg.Client
+	Phone    string
+	Password string
 }
 
 // Start поднимает соединение и держит его открытым.
@@ -94,8 +64,8 @@ func (c *Client) Start(ctx context.Context, onReady func() error) error {
 
 func (c *Client) authenticate(ctx context.Context) error {
 	userAuth := auth.Constant(
-		c.cfg.Phone,
-		c.cfg.Password,
+		c.Phone,
+		c.Password,
 		ConsoleInput{},
 	)
 

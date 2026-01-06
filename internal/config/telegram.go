@@ -1,9 +1,13 @@
 package config
 
+import "time"
+
 type Telegram struct {
-	ApiID    int    `env:"TG_API_ID,required"`
-	ApiHash  string `env:"TG_API_HASH,required"`
-	Phone    string `env:"TG_PHONE,required"`
-	Password string `env:"TG_PASSWORD"`
-	BotToken string `env:"TG_BOT_TOKEN"`
+	ApiID           int    `env:"TG_API_ID,required"`
+	ApiHash         string `env:"TG_API_HASH,required"`
+	RatePerClientMs int    `env:"RATE_PER_CLIENT_MS,required"`
+}
+
+func (t *Telegram) GetRatePerClient() time.Duration {
+	return time.Duration(t.RatePerClientMs) * time.Millisecond
 }
