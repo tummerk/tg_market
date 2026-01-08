@@ -3,11 +3,10 @@ package notifier
 import (
 	"context"
 	"fmt"
+	"tg_market/internal/domain/entity"
 
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
-
-	service "tg_market/internal/domain/service/gift"
 )
 
 type TelegramBot struct {
@@ -28,7 +27,7 @@ func NewTelegramBot(token string, chatID int64) (*TelegramBot, error) {
 }
 
 // Run запускает обработку сделок из канала.
-func (b *TelegramBot) Run(ctx context.Context, deals <-chan service.GoodDeal) error {
+func (b *TelegramBot) Run(ctx context.Context, deals <-chan entity.Deal) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -44,20 +43,23 @@ func (b *TelegramBot) Run(ctx context.Context, deals <-chan service.GoodDeal) er
 	}
 }
 
-func (b *TelegramBot) SendDeal(ctx context.Context, deal service.GoodDeal) error {
+func (b *TelegramBot) SendDeal(ctx context.Context, deal entity.Deal) error {
 	text := fmt.Sprintf(
 		"🔥 <b>GEM FOUND!</b>\n\n"+
 			"🎁 <b>Name:</b> %s\n"+
-			"💰 <b>Price:</b> %d ⭐\n"+
-			"📊 <b>Avg Price:</b> %d ⭐\n"+
-			"📉 <b>Discount:</b> %.1f%%\n\n"+
+			"💰 <b>StarPrice:</b> %d ⭐\n"+
+			"💰 <b>TonPrice:</b> %.2f\n"+
+			"📊 <b>Avg StarPrice:</b> %d ⭐\n"+
+			"📉 <b>Profit:</b> %.1f%%\n\n"+
 			"🔗 <a href=\"%s\">Buy Now</a>",
 		deal.GiftType.Name,
-		deal.Gift.Price,
+		deal.Gift.StarPrice,
+		deal.Gift.TonPrice,
 		deal.AvgPrice,
-		deal.Discount,
+		deal.Profit,
 		deal.Gift.Address,
 	)
+	fmt.Println(text)
 
 	msg := tu.Message(
 		tu.ID(b.chatID),

@@ -4,8 +4,7 @@
 CREATE TABLE IF NOT EXISTS gift_types (
                                           id BIGINT PRIMARY KEY,
                                           name VARCHAR(255),
-                                          address VARCHAR,
-                                          sticker_id BIGINT,
+                                          slug   VARCHAR(255),
                                           store_price BIGINT NOT NULL DEFAULT 0,  -- Цена в звездах
                                           total_supply INT NOT NULL DEFAULT 0,    -- Общий тираж
                                           remaining_supply INT NOT NULL DEFAULT 0,-- Остаток в магазине
@@ -23,8 +22,10 @@ CREATE TABLE IF NOT EXISTS gifts (
                                      type_id BIGINT NOT NULL REFERENCES gift_types(id) ON DELETE CASCADE,
                                      address VARCHAR,
                                      num INT NOT NULL,
+                                     numRating INT,
                                      owner_id BIGINT,
-                                     price BIGINT DEFAULT NULL,
+                                     star_price BIGINT DEFAULT NULL,
+                                     ton_price BIGINT DEFAULT NULL,
                                      attributes JSONB DEFAULT '{}',
                                      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

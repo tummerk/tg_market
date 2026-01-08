@@ -5,7 +5,7 @@ import "time"
 type GiftType struct {
 	ID               int64     `json:"id"`
 	Name             string    `json:"name"`
-	StickerID        int64     `json:"sticker_id"`
+	Slug             string    `json:"slug"`
 	StorePrice       int64     `json:"store_price"`
 	TotalSupply      int       `json:"total_supply"`
 	RemainingSupply  int       `json:"remaining_supply"`

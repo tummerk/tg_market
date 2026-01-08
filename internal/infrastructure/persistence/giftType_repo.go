@@ -45,7 +45,6 @@ func (r *GiftTypeRepository) withTx(ctx context.Context, fn func(tx *sqlx.Tx) er
 	return nil
 }
 
-// Create — добавляем поле average_price в INSERT
 func (r *GiftTypeRepository) Create(ctx context.Context, gift *entity.GiftType) error {
 	return r.withTx(ctx, func(tx *sqlx.Tx) error {
 		schema := FromGiftType(gift)
@@ -55,15 +54,15 @@ func (r *GiftTypeRepository) Create(ctx context.Context, gift *entity.GiftType) 
 
 		query := `
 			INSERT INTO gift_types (
-				id, name, sticker_id, store_price, total_supply, 
+				id, name, slug, store_price, total_supply, 
 				remaining_supply, market_floor_price, average_price, 
 				market_quantity, updated_at
 			) VALUES (
-				:id, :name, :sticker_id, :store_price, :total_supply, 
+				:id, :name, :slug, :store_price, :total_supply, 
 				:remaining_supply, :market_floor_price, :average_price, 
 				:market_quantity, :updated_at
 			)
-			ON CONFLICT (id) DO NOTHING` // Можно добавить ON CONFLICT для идемпотентности
+			ON CONFLICT (id) DO NOTHING`
 
 		_, err := tx.NamedExecContext(ctx, query, schema)
 		if err != nil {
@@ -73,7 +72,6 @@ func (r *GiftTypeRepository) Create(ctx context.Context, gift *entity.GiftType) 
 	})
 }
 
-// GetByID — без изменений (структура Schema сама подтянет поле)
 func (r *GiftTypeRepository) GetByID(ctx context.Context, id int64) (*entity.GiftType, error) {
 	query := `SELECT * FROM gift_types WHERE id = $1`
 	var schema GiftTypeSchema
@@ -86,7 +84,6 @@ func (r *GiftTypeRepository) GetByID(ctx context.Context, id int64) (*entity.Gif
 	return schema.ToDomain(), nil
 }
 
-// Update — Полное обновление (включая average_price)
 func (r *GiftTypeRepository) Update(ctx context.Context, gift *entity.GiftType) error {
 	return r.withTx(ctx, func(tx *sqlx.Tx) error {
 		schema := FromGiftType(gift)
@@ -95,7 +92,7 @@ func (r *GiftTypeRepository) Update(ctx context.Context, gift *entity.GiftType) 
 		query := `
 			UPDATE gift_types SET
 				name = :name,
-				sticker_id = :sticker_id,
+				slug = :slug,
 				store_price = :store_price,
 				total_supply = :total_supply,
 				remaining_supply = :remaining_supply,
@@ -118,7 +115,6 @@ func (r *GiftTypeRepository) Update(ctx context.Context, gift *entity.GiftType) 
 	})
 }
 
-// UpdateStats — обновление ТОЛЬКО рыночных данных (эффективно для воркера)
 func (r *GiftTypeRepository) UpdateStats(ctx context.Context, id int64, floorPrice, avgPrice int64, quantity int) error {
 	return r.withTx(ctx, func(tx *sqlx.Tx) error {
 		query := `
@@ -142,7 +138,6 @@ func (r *GiftTypeRepository) UpdateStats(ctx context.Context, id int64, floorPri
 	})
 }
 
-// DecreaseSupply — уменьшение остатка
 func (r *GiftTypeRepository) DecreaseSupply(ctx context.Context, id int64) error {
 	return r.withTx(ctx, func(tx *sqlx.Tx) error {
 		query := `
@@ -158,7 +153,6 @@ func (r *GiftTypeRepository) DecreaseSupply(ctx context.Context, id int64) error
 
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
-			// Проверяем существование, чтобы отдать точную ошибку
 			var exists bool
 			_ = tx.GetContext(ctx, &exists, `SELECT EXISTS(SELECT 1 FROM gift_types WHERE id = $1)`, id)
 			if !exists {
@@ -170,7 +164,6 @@ func (r *GiftTypeRepository) DecreaseSupply(ctx context.Context, id int64) error
 	})
 }
 
-// List — получение списка
 func (r *GiftTypeRepository) List(ctx context.Context, limit, offset int) ([]entity.GiftType, error) {
 	query := `SELECT * FROM gift_types ORDER BY id ASC LIMIT $1 OFFSET $2`
 

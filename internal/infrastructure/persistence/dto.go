@@ -1,7 +1,9 @@
 package persistence
 
 import (
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"tg_market/internal/domain/entity"
 	"tg_market/internal/domain/value"
 	"time"
@@ -9,32 +11,46 @@ import (
 
 // giftSchema — внутренняя структура для маппинга строки БД.
 type giftSchema struct {
-	ID         int64     `db:"id"`
-	TypeID     int64     `db:"type_id"`
-	Address    string    `db:"address"`
-	Num        int       `db:"num"`
-	OwnerID    int64     `db:"owner_id"`
-	Price      int64     `db:"price"`
-	Attributes []byte    `db:"attributes"`
-	UpdatedAt  time.Time `db:"updated_at"`
+	ID         int64           `db:"id"`
+	TypeID     int64           `db:"type_id"`
+	Num        int             `db:"num"`
+	NumRating  int             `db:"numRating"`
+	OwnerID    int64           `db:"owner_id"`
+	Address    sql.NullString  `db:"address"`    // Может быть NULL
+	StarPrice  sql.NullInt64   `db:"star_price"` // Может быть NULL (не продается)
+	TonPrice   sql.NullFloat64 `db:"ton_price"`  // Может быть NULL
+	Attributes []byte          `db:"attributes"` // JSONB
+	UpdatedAt  time.Time       `db:"updated_at"`
 }
 
+// toDomain конвертирует строку БД в доменную сущность
 func (s *giftSchema) toDomain() (*entity.Gift, error) {
-	attrs, err := s.parseAttributes()
-	if err != nil {
-		return nil, err
+	var attrs value.GiftAttributes
+	if len(s.Attributes) > 0 {
+		if err := json.Unmarshal(s.Attributes, &attrs); err != nil {
+			return nil, fmt.Errorf("unmarshal attrs: %w", err)
+		}
 	}
 
-	return &entity.Gift{
+	gift := &entity.Gift{
 		ID:         s.ID,
 		TypeID:     s.TypeID,
-		Address:    s.Address,
 		Num:        s.Num,
+		NumRating:  s.NumRating,
 		OwnerID:    s.OwnerID,
-		Price:      s.Price,
+		Address:    s.Address.String,
 		Attributes: attrs,
 		UpdatedAt:  s.UpdatedAt,
-	}, nil
+	}
+
+	if s.StarPrice.Valid {
+		gift.StarPrice = s.StarPrice.Int64
+	}
+	if s.TonPrice.Valid {
+		gift.TonPrice = s.TonPrice.Float64
+	}
+
+	return gift, nil
 }
 
 func (s *giftSchema) parseAttributes() (value.GiftAttributes, error) {
@@ -51,7 +67,7 @@ func (s *giftSchema) parseAttributes() (value.GiftAttributes, error) {
 type GiftTypeSchema struct {
 	ID               int64     `db:"id"`
 	Name             string    `db:"name"`
-	StickerID        int64     `db:"sticker_id"`
+	Slug             string    `db:"slug"`
 	StorePrice       int64     `db:"store_price"`
 	TotalSupply      int       `db:"total_supply"`
 	RemainingSupply  int       `db:"remaining_supply"`
@@ -66,7 +82,7 @@ func FromGiftType(e *entity.GiftType) *GiftTypeSchema {
 	return &GiftTypeSchema{
 		ID:               e.ID,
 		Name:             e.Name,
-		StickerID:        e.StickerID,
+		Slug:             e.Slug,
 		StorePrice:       e.StorePrice,
 		TotalSupply:      e.TotalSupply,
 		RemainingSupply:  e.RemainingSupply,
@@ -82,7 +98,7 @@ func (s *GiftTypeSchema) ToDomain() *entity.GiftType {
 	return &entity.GiftType{
 		ID:               s.ID,
 		Name:             s.Name,
-		StickerID:        s.StickerID,
+		Slug:             s.Slug,
 		StorePrice:       s.StorePrice,
 		TotalSupply:      s.TotalSupply,
 		RemainingSupply:  s.RemainingSupply,

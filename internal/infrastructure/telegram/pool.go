@@ -147,10 +147,14 @@ func (p *ClientPool) GetGiftTypes(ctx context.Context, hash int) ([]entity.GiftT
 	return p.next().GetGiftTypes(ctx, hash)
 }
 
-func (p *ClientPool) GetMarketGifts(ctx context.Context, giftTypeID int64, limit int) ([]entity.Gift, error) {
-	return p.next().GetMarketGifts(ctx, giftTypeID, limit)
+func (p *ClientPool) GetMarketDeals(ctx context.Context, giftTypeID int64, limit int) ([]entity.Deal, error) {
+	return p.next().GetMarketDeals(ctx, giftTypeID, limit)
 }
 
 func (p *ClientPool) GetLastPrices(ctx context.Context, giftTypeID int, limit int) ([]int, error) {
 	return p.next().GetLastPrices(ctx, giftTypeID, limit)
+}
+
+func (p *ClientPool) GetGiftsPage(ctx context.Context, giftID int64, offset string, limit int) ([]entity.Gift, string, error) {
+	return p.next().GetGiftsPage(ctx, giftID, offset, limit)
 }

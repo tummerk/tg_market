@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"tg_market/internal/config"
+	"tg_market/internal/domain/entity"
 	service "tg_market/internal/domain/service/gift"
 	"tg_market/internal/infrastructure/notifier"
 	"tg_market/internal/infrastructure/persistence"
@@ -64,7 +65,7 @@ func Run(ctx context.Context, log *slog.Logger, cancel context.CancelFunc) error
 	}
 	log.Info("✅ Telegram Pool Ready", "clients", pool.Size())
 
-	dealsCh := make(chan service.GoodDeal, 100)
+	dealsCh := make(chan entity.Deal, 100)
 
 	// Notify bot
 
@@ -90,9 +91,16 @@ func Run(ctx context.Context, log *slog.Logger, cancel context.CancelFunc) error
 	svc := service.NewGiftService(giftTypeRepo, giftRepo, pool).
 		WithDiscountThreshold(10)
 
+	if err != nil {
+		return fmt.Errorf("update all gift price: %w", err)
+	}
+	//опционально
+	//svc.SyncCatalog(ctx)
+
 	targetTypes := []int64{
-		6003373314888696650, //candy cane
 		6014591077976114307, //snoop dog
+		5773668482394620318,
+		5935936766358847989, //snoop cigars
 	}
 
 	scanner := worker.NewMarketScanner(svc, giftTypeRepo, dealsCh).

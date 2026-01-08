@@ -65,32 +65,26 @@ func (c *Client) GetGiftTypes(ctx context.Context, hash int) ([]entity.GiftType,
 
 	result := make([]entity.GiftType, 0, len(giftsInterfaces))
 
-	for _, gRaw := range giftsInterfaces {
-		g, ok := gRaw.(*tg.StarGift)
+	for _, giftRaw := range giftsInterfaces {
+		gift, ok := giftRaw.(*tg.StarGift)
 		if !ok {
 			continue
 		}
 
-		var stickerID int64
-		if doc, ok := g.Sticker.(*tg.Document); ok {
-			stickerID = doc.ID
-		}
-
 		totalSupply := 0
 		remainingSupply := -1
-		if total, ok := g.GetAvailabilityTotal(); ok {
+		if total, ok := gift.GetAvailabilityTotal(); ok {
 			totalSupply = total
 		}
 
-		if remains, ok := g.GetAvailabilityRemains(); ok {
+		if remains, ok := gift.GetAvailabilityRemains(); ok {
 			remainingSupply = remains
 		}
 
 		item := entity.GiftType{
-			ID:               g.ID,
-			Name:             g.Title,
-			StickerID:        stickerID,
-			StorePrice:       g.Stars,
+			ID:               gift.ID,
+			Name:             gift.Title,
+			StorePrice:       gift.Stars,
 			TotalSupply:      totalSupply,
 			RemainingSupply:  remainingSupply,
 			MarketFloorPrice: 0,
@@ -105,12 +99,10 @@ func (c *Client) GetGiftTypes(ctx context.Context, hash int) ([]entity.GiftType,
 	return result, nil
 }
 
-func (c *Client) GetMarketGifts(ctx context.Context, giftTypeID int64, limit int) ([]entity.Gift, error) {
-	// 1. Обязательный таймаут, чтобы не зависнуть
+func (c *Client) GetMarketDeals(ctx context.Context, giftTypeID int64, limit int) ([]entity.Deal, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	// 2. Формируем запрос
 	req := &tg.PaymentsGetResaleStarGiftsRequest{
 		GiftID:      giftTypeID,
 		Limit:       limit,
@@ -122,9 +114,18 @@ func (c *Client) GetMarketGifts(ctx context.Context, giftTypeID int64, limit int
 		return nil, fmt.Errorf("tg api call failed: %w", err)
 	}
 
-	// 4. Парсим результат
-	var result []entity.Gift
 	rawGifts := resRaw.GetGifts()
+	rawUsers := resRaw.GetUsers()
+
+	// Map для быстрого поиска accessHash
+	users := make(map[int64]int64, len(rawUsers))
+	for _, u := range rawUsers {
+		if user, ok := u.(*tg.User); ok {
+			users[user.ID] = user.AccessHash
+		}
+	}
+
+	deals := make([]entity.Deal, 0, len(rawGifts))
 
 	for _, g := range rawGifts {
 		u, ok := g.(*tg.StarGiftUnique)
@@ -132,42 +133,181 @@ func (c *Client) GetMarketGifts(ctx context.Context, giftTypeID int64, limit int
 			continue
 		}
 
-		// Достаем цену (логика как в твоем GetLastPrices)
-		var price int64
-		opts, ok := u.GetResellAmount()
-		if ok && len(opts) > 0 {
-			switch v := opts[0].(type) {
-			case *tg.StarsAmount:
-				price = v.Amount
-			}
+		var starPrice int64
+		var tonPrice float64
+		if opts, ok := u.GetResellAmount(); ok && len(opts) >= 2 {
+			starPrice = opts[0].GetAmount()
+			tonPrice = float64(opts[1].GetAmount()) / 1_000_000_000
 		}
 
-		// Если цены нет или она 0 — пропускаем
-		if price <= 0 {
+		if starPrice <= 0 {
 			continue
 		}
 
-		// Достаем ID владельца (полезно знать, кто продает)
 		var ownerID int64
 		if ownerPeer, ok := u.GetOwnerID(); ok {
-			switch p := ownerPeer.(type) {
-			case *tg.PeerUser:
+			if p, ok := ownerPeer.(*tg.PeerUser); ok {
 				ownerID = p.UserID
 			}
 		}
 
-		var link string
 		slug := u.GetSlug()
-		link = fmt.Sprintf("https://t.me/nft/%s-%d", slug, u.Num)
+		link := fmt.Sprintf("https://t.me/nft/%s-%d", slug, u.Num)
 
-		result = append(result, entity.Gift{
-			ID:      u.ID,
-			Price:   price,
-			Num:     u.Num,
-			OwnerID: ownerID,
-			TypeID:  giftTypeID,
-			Address: link,
+		deals = append(deals, entity.Deal{
+			Gift: &entity.Gift{
+				ID:        u.ID,
+				StarPrice: starPrice,
+				TonPrice:  tonPrice,
+				Num:       u.Num,
+				NumRating: 0, // Will be set by the service when processing ratings
+				Slug:      slug,
+				OwnerID:   ownerID,
+				TypeID:    giftTypeID,
+				Address:   link,
+			},
+			SellerAccessHash: users[ownerID],
+			// GiftType, MarketPrice, Profit — заполнит сервис
 		})
 	}
-	return result, nil
+
+	return deals, nil
+}
+
+// BuyDeal - покупает сделку с маркета
+func (c *Client) BuyDeal(ctx context.Context, deal entity.Deal) error {
+	gift := deal.Gift
+	giftType := deal.GiftType
+
+	logger(ctx).Info("buying deal",
+		"gift_id", gift.ID,
+		"type", giftType.Name,
+		"num", gift.Num,
+		"price_stars", gift.StarPrice,
+		"price_ton", gift.TonPrice,
+		"profit", deal.Profit,
+	)
+
+	// 1. Формируем InputPeer владельца
+	ownerPeer := &tg.InputPeerUser{
+		UserID:     gift.OwnerID,
+		AccessHash: deal.SellerAccessHash,
+	}
+
+	// 2. Формируем слаг инвойса (slug-num)
+	invoiceSlug := fmt.Sprintf("%s-%d", gift.Slug, gift.Num)
+
+	// 3. Создаём инвойс
+	invoice := &tg.InputInvoiceStarGiftResale{
+		Ton:  true, // Платим в TON
+		Slug: invoiceSlug,
+		ToID: ownerPeer,
+	}
+
+	// 4. Получаем форму оплаты
+	formRaw, err := c.api.PaymentsGetPaymentForm(ctx, &tg.PaymentsGetPaymentFormRequest{
+		Invoice: invoice,
+	})
+	if err != nil {
+		return fmt.Errorf("get payment form: %w", err)
+	}
+
+	// 5. Извлекаем FormID
+	formID, err := c.extractFormID(formRaw)
+	if err != nil {
+		return err
+	}
+
+	logger(ctx).Debug("payment form received", "form_id", formID)
+
+	// 6. Отправляем оплату
+	result, err := c.api.PaymentsSendStarsForm(ctx, &tg.PaymentsSendStarsFormRequest{
+		FormID:  formID,
+		Invoice: invoice,
+	})
+	if err != nil {
+		return fmt.Errorf("send payment: %w", err)
+	}
+
+	logger(ctx).Info("deal purchased successfully",
+		"gift_id", gift.ID,
+		"result", fmt.Sprintf("%T", result),
+	)
+
+	return nil
+}
+
+// extractFormID извлекает FormID из ответа API
+func (c *Client) extractFormID(formRaw tg.PaymentsPaymentFormClass) (int64, error) {
+	switch f := formRaw.(type) {
+	case *tg.PaymentsPaymentForm:
+		return f.FormID, nil
+	case *tg.PaymentsPaymentFormStars:
+		return f.FormID, nil
+	default:
+		return 0, fmt.Errorf("unknown payment form type: %T", formRaw)
+	}
+}
+
+// GetGiftsPage - Функция получает ОДНУ страницу подарков
+func (c *Client) GetGiftsPage(ctx context.Context, giftID int64, offset string, limit int) ([]entity.Gift, string, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	req := &tg.PaymentsGetResaleStarGiftsRequest{
+		GiftID:      giftID,
+		Limit:       limit,
+		SortByPrice: true,
+		Offset:      offset,
+	}
+
+	resRaw, err := c.api.PaymentsGetResaleStarGifts(ctx, req)
+	if err != nil {
+		return nil, "", fmt.Errorf("ошибка API: %w", err)
+	}
+
+	rawGifts := resRaw.GetGifts()
+	nextOffset := resRaw.NextOffset
+
+	gifts := make([]entity.Gift, 0, len(rawGifts))
+
+	for _, g := range rawGifts {
+		u, ok := g.(*tg.StarGiftUnique)
+		if !ok {
+			continue
+		}
+
+		var starPrice int64
+		var tonPrice float64
+		if opts, ok := u.GetResellAmount(); ok && len(opts) >= 2 {
+			starPrice = opts[0].GetAmount()
+			tonPrice = float64(opts[1].GetAmount()) / 1_000_000_000
+		}
+
+		var ownerID int64
+		if ownerPeer, ok := u.GetOwnerID(); ok {
+			if p, ok := ownerPeer.(*tg.PeerUser); ok {
+				ownerID = p.UserID
+			}
+		}
+
+		slug := u.GetSlug()
+		link := fmt.Sprintf("https://t.me/nft/%s-%d", slug, u.Num)
+
+		gifts = append(gifts, entity.Gift{
+			ID:        u.ID,
+			StarPrice: starPrice,
+			TonPrice:  tonPrice,
+			Num:       u.Num,
+			NumRating: 0, // Will be set by the service when processing ratings
+			Slug:      slug,
+			OwnerID:   ownerID,
+			TypeID:    giftID,
+			Address:   link,
+			UpdatedAt: time.Now(),
+		})
+	}
+
+	return gifts, nextOffset, nil
 }
