@@ -91,16 +91,17 @@ func Run(ctx context.Context, log *slog.Logger, cancel context.CancelFunc) error
 	svc := service.NewGiftService(giftTypeRepo, giftRepo, pool).
 		WithDiscountThreshold(10)
 
-	if err != nil {
-		return fmt.Errorf("update all gift price: %w", err)
-	}
-	//опционально
-	//svc.SyncCatalog(ctx)
-
 	targetTypes := []int64{
-		6014591077976114307, //snoop dog
-		5773668482394620318,
-		5935936766358847989, //snoop cigars
+		6012435906336654262,
+		5825480571261813595,
+		6005880141270483700,
+		5897581235231785485,
+		5870862540036113469,
+		5915502858152706668,
+		5821205665758053411,
+		5935936766358847989,
+		5981132629905245483,
+		5983471780763796287,
 	}
 
 	scanner := worker.NewMarketScanner(svc, giftTypeRepo, dealsCh).

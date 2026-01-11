@@ -158,3 +158,7 @@ func (p *ClientPool) GetLastPrices(ctx context.Context, giftTypeID int, limit in
 func (p *ClientPool) GetGiftsPage(ctx context.Context, giftID int64, offset string, limit int) ([]entity.Gift, string, error) {
 	return p.next().GetGiftsPage(ctx, giftID, offset, limit)
 }
+
+func (p *ClientPool) BuyDeal(ctx context.Context, deal entity.Deal) error {
+	return p.clients[0].client.BuyDeal(ctx, deal)
+}

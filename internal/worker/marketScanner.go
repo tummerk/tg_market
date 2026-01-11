@@ -155,14 +155,14 @@ func (w *MarketScanner) scanOne(ctx context.Context, giftType entity.GiftType) (
 		return 0, err
 	}
 
-	deals, err := w.giftService.CheckMarketForType(ctx, giftType) // Изменено: передаём значение
+	deals, err := w.giftService.CheckMarketForType(ctx, giftType)
 	if err != nil {
 		return 0, err
 	}
 
 	for _, deal := range deals {
 		select {
-		case w.deals <- deal: // Изменено: entity.Deal
+		case w.deals <- deal:
 		case <-ctx.Done():
 			return len(deals), ctx.Err()
 		}

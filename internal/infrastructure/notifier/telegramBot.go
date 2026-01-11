@@ -3,6 +3,8 @@ package notifier
 import (
 	"context"
 	"fmt"
+	"os/exec" // <--- 1. Добавили для запуска команд
+	"runtime" // <--- 1. Добавили для определения ОС
 	"tg_market/internal/domain/entity"
 
 	"github.com/mymmrac/telego"
@@ -37,13 +39,20 @@ func (b *TelegramBot) Run(ctx context.Context, deals <-chan entity.Deal) error {
 				return nil
 			}
 			if err := b.SendDeal(ctx, deal); err != nil {
-				logger(ctx).Error("failed to send deal", "error", err)
+				// Логгер лучше передавать или инициализировать глобально,
+				// здесь оставил как было в примере
+				fmt.Printf("failed to send deal: %v\n", err)
 			}
 		}
 	}
 }
 
 func (b *TelegramBot) SendDeal(ctx context.Context, deal entity.Deal) error {
+	// --- 3. ВЫЗЫВАЕМ ЗВУК ЗДЕСЬ ---
+	// Запускаем в горутине, чтобы звук не тормозил отправку сообщения
+	go playSound()
+	// ------------------------------
+
 	text := fmt.Sprintf(
 		"🔥 <b>GEM FOUND!</b>\n\n"+
 			"🎁 <b>Name:</b> %s\n"+
@@ -74,10 +83,26 @@ func (b *TelegramBot) SendDeal(ctx context.Context, deal entity.Deal) error {
 	return nil
 }
 
-// SendText отправляет простое текстовое сообщение.
 func (b *TelegramBot) SendText(ctx context.Context, text string) error {
 	msg := tu.Message(tu.ID(b.chatID), text)
-
 	_, err := b.bot.SendMessage(ctx, msg)
 	return err
+}
+
+// --- 2. ФУНКЦИЯ ВОСПРОИЗВЕДЕНИЯ ЗВУКА ---
+func playSound() {
+	var cmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("afplay", "/System/Library/Sounds/Glass.aiff")
+	case "windows":
+		cmd = exec.Command("powershell", "-c", "[System.Console]::Beep(1000, 500)")
+	default:
+		return
+	}
+
+	if cmd != nil {
+		_ = cmd.Run()
+	}
 }

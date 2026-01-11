@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/gotd/td/tg"
 	"tg_market/internal/domain/entity"
+	"tg_market/internal/domain/value"
 	"time"
 )
 
@@ -151,23 +152,43 @@ func (c *Client) GetMarketDeals(ctx context.Context, giftTypeID int64, limit int
 			}
 		}
 
+		// --- НАЧАЛО: Парсинг атрибутов ---
+		var attrs value.GiftAttributes
+		var totalRarity int
+
+		// Проходимся по всем атрибутам подарка
+		for _, attr := range u.GetAttributes() {
+			switch a := attr.(type) {
+			case *tg.StarGiftAttributeModel:
+				attrs.Model = a.Name
+				totalRarity += a.RarityPermille
+			case *tg.StarGiftAttributePattern:
+				attrs.Pattern = a.Name
+				totalRarity += a.RarityPermille
+			case *tg.StarGiftAttributeBackdrop:
+				attrs.Backdrop = a.Name
+				totalRarity += a.RarityPermille
+			}
+		}
+		attrs.RarityPerMille = totalRarity
+
 		slug := u.GetSlug()
 		link := fmt.Sprintf("https://t.me/nft/%s-%d", slug, u.Num)
 
 		deals = append(deals, entity.Deal{
 			Gift: &entity.Gift{
-				ID:        u.ID,
-				StarPrice: starPrice,
-				TonPrice:  tonPrice,
-				Num:       u.Num,
-				NumRating: 0, // Will be set by the service when processing ratings
-				Slug:      slug,
-				OwnerID:   ownerID,
-				TypeID:    giftTypeID,
-				Address:   link,
+				ID:         u.ID,
+				StarPrice:  starPrice,
+				TonPrice:   tonPrice,
+				Num:        u.Num,
+				NumRating:  0,
+				Slug:       slug,
+				OwnerID:    ownerID,
+				TypeID:     giftTypeID,
+				Address:    link,
+				Attributes: attrs, // <--- Вставляем распаршенные атрибуты
 			},
 			SellerAccessHash: users[ownerID],
-			// GiftType, MarketPrice, Profit — заполнит сервис
 		})
 	}
 
@@ -177,15 +198,12 @@ func (c *Client) GetMarketDeals(ctx context.Context, giftTypeID int64, limit int
 // BuyDeal - покупает сделку с маркета
 func (c *Client) BuyDeal(ctx context.Context, deal entity.Deal) error {
 	gift := deal.Gift
-	giftType := deal.GiftType
+	// giftType := deal.GiftType // (Для логов, если нужно)
 
-	logger(ctx).Info("buying deal",
-		"gift_id", gift.ID,
-		"type", giftType.Name,
+	logger(ctx).Info("⚡️ BUYING DEAL START",
+		"slug", gift.Slug,
 		"num", gift.Num,
-		"price_stars", gift.StarPrice,
-		"price_ton", gift.TonPrice,
-		"profit", deal.Profit,
+		"ton_price", gift.TonPrice,
 	)
 
 	// 1. Формируем InputPeer владельца
@@ -194,55 +212,92 @@ func (c *Client) BuyDeal(ctx context.Context, deal entity.Deal) error {
 		AccessHash: deal.SellerAccessHash,
 	}
 
-	// 2. Формируем слаг инвойса (slug-num)
-	invoiceSlug := fmt.Sprintf("%s-%d", gift.Slug, gift.Num)
-
-	// 3. Создаём инвойс
-	invoice := &tg.InputInvoiceStarGiftResale{
-		Ton:  true, // Платим в TON
-		Slug: invoiceSlug,
-		ToID: ownerPeer,
+	peers := []struct {
+		name string
+		peer tg.InputPeerClass
+	}{
+		{"Self", &tg.InputPeerSelf{}}, // Приоритет (сработало в тесте)
+		{"Owner", ownerPeer},          // Резерв
 	}
 
-	// 4. Получаем форму оплаты
-	formRaw, err := c.api.PaymentsGetPaymentForm(ctx, &tg.PaymentsGetPaymentFormRequest{
-		Invoice: invoice,
-	})
-	if err != nil {
-		return fmt.Errorf("get payment form: %w", err)
+	// Варианты слага
+	rawSlug := gift.Slug
+	slugs := []string{
+		fmt.Sprintf("%s-%d", rawSlug, gift.Num), // Double Num: PreciousPeach-1561-1561 (если raw уже с номером)
+		rawSlug,                                 // Single
+		fmt.Sprintf("nft/%s", rawSlug),
 	}
 
-	// 5. Извлекаем FormID
+	// Если в gift.Slug нет номера (редко, но бывает), то нужно добавить его
+	// Но обычно парсер возвращает уже Slug-Num.
+
+	// 3. Перебор (Brute Force)
+	for _, p := range peers {
+		for _, s := range slugs {
+			invoice := &tg.InputInvoiceStarGiftResale{
+				Ton:  true,
+				Slug: s,
+				ToID: p.peer,
+			}
+
+			// Запрос формы
+			formRaw, err := c.api.PaymentsGetPaymentForm(ctx, &tg.PaymentsGetPaymentFormRequest{
+				Invoice: invoice,
+			})
+
+			if err != nil {
+				// Логируем только для дебага, чтобы не спамить
+				// logger(ctx).Debug("try failed", "slug", s, "peer", p.name, "err", err)
+				continue
+			}
+
+			logger(ctx).Info("✅ FORM RECEIVED", "slug", s, "peer", p.name)
+
+			// 4. Оплата
+			return c.processPayment(ctx, formRaw, invoice)
+		}
+	}
+
+	return fmt.Errorf("failed to buy: all slug/peer combinations failed")
+}
+
+// processPayment обрабатывает форму и шлет деньги
+func (c *Client) processPayment(ctx context.Context, formRaw tg.PaymentsPaymentFormClass, invoice tg.InputInvoiceClass) error {
 	formID, err := c.extractFormID(formRaw)
 	if err != nil {
 		return err
 	}
 
-	logger(ctx).Debug("payment form received", "form_id", formID)
+	logger(ctx).Info("🚀 SENDING PAYMENT...", "form_id", formID)
 
-	// 6. Отправляем оплату
 	result, err := c.api.PaymentsSendStarsForm(ctx, &tg.PaymentsSendStarsFormRequest{
 		FormID:  formID,
 		Invoice: invoice,
 	})
 	if err != nil {
-		return fmt.Errorf("send payment: %w", err)
+		return fmt.Errorf("send payment failed: %w", err)
 	}
 
-	logger(ctx).Info("deal purchased successfully",
-		"gift_id", gift.ID,
-		"result", fmt.Sprintf("%T", result),
-	)
-
-	return nil
+	// Проверяем результат
+	switch r := result.(type) {
+	case *tg.PaymentsPaymentResult:
+		logger(ctx).Info("🏆 PAYMENT SUCCESS!")
+		return nil
+	case *tg.PaymentsPaymentVerificationNeeded:
+		return fmt.Errorf("verification needed: %s", r.URL)
+	default:
+		return fmt.Errorf("unknown payment result: %T", result)
+	}
 }
 
-// extractFormID извлекает FormID из ответа API
+// extractFormID извлекает FormID (с поддержкой нового типа)
 func (c *Client) extractFormID(formRaw tg.PaymentsPaymentFormClass) (int64, error) {
 	switch f := formRaw.(type) {
 	case *tg.PaymentsPaymentForm:
 		return f.FormID, nil
 	case *tg.PaymentsPaymentFormStars:
+		return f.FormID, nil
+	case *tg.PaymentsPaymentFormStarGift: // <--- ВАЖНО: Добавлен новый тип
 		return f.FormID, nil
 	default:
 		return 0, fmt.Errorf("unknown payment form type: %T", formRaw)

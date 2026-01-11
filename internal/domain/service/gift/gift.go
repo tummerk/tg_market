@@ -16,6 +16,7 @@ import (
 const (
 	priceCacheTTL   = 5 * time.Minute
 	countToAvgPrice = 10
+	balance         = 13
 )
 
 type TgClient interface {
@@ -23,6 +24,7 @@ type TgClient interface {
 	GetLastPrices(ctx context.Context, giftTypeID int, limit int) ([]int, error)
 	GetMarketDeals(ctx context.Context, giftTypeID int64, limit int) ([]entity.Deal, error)
 	GetGiftsPage(ctx context.Context, giftID int64, offset string, limit int) ([]entity.Gift, string, error)
+	BuyDeal(ctx context.Context, deal entity.Deal) error
 }
 
 type GiftTypeRepository interface {
@@ -64,7 +66,7 @@ func NewGiftService(
 		giftRepo:           giftRepo,
 		tgClient:           tgClient,
 		minDiscountPercent: 20.0,
-		maxOffersToCheck:   5,
+		maxOffersToCheck:   20,
 		processedCache:     cache.New(time.Hour, priceCacheTTL),
 	}
 }
@@ -144,83 +146,113 @@ func (s *GiftService) CheckMarketForType(ctx context.Context, giftType entity.Gi
 		return nil, nil
 	}
 
-	// Клиент возвращает Deal с заполненным Gift и SellerAccessHash
+	// 1. Получаем сделки с рынка
 	deals, err := s.tgClient.GetMarketDeals(ctx, giftType.ID, s.maxOffersToCheck)
 	if err != nil {
 		return nil, fmt.Errorf("get market deals: %w", err)
 	}
 
 	var goodDeals []entity.Deal
+	var newDealsCount int
 
 	for i := range deals {
 		deal := &deals[i]
 		giftIDStr := fmt.Sprint(deal.Gift.ID)
 
-		// Уже обрабатывали?
+		// Кэш
 		if _, found := s.processedCache.Get(giftIDStr); found {
 			continue
 		}
-		// Обогащаем Deal бизнес-данными и проверяем выгодность
-		if !s.enrichAndEvaluate(deal, giftType) {
+
+		// 2. ОБЩИЙ АНАЛИЗ (Фильтрация мусора)
+		// Эта функция решает, стоит ли вообще обращать внимание на лот (добавлять в список/базу)
+		isGem, ratingScore := s.analyzeDeal(deal, giftType)
+
+		if !isGem {
 			s.processedCache.Set(giftIDStr, true, cache.DefaultExpiration)
 			continue
 		}
 
-		// Проверяем, есть ли уже в БД
+		// 3. Проверка БД
 		exists, err := s.giftRepo.Exists(ctx, deal.Gift.ID)
 		if err != nil {
 			logger(ctx).Error("db check failed", "err", err)
 			continue
 		}
-
 		if exists {
 			s.processedCache.Set(giftIDStr, true, cache.DefaultExpiration)
 			continue
 		}
 
-		// Сохраняем подарок
+		newDealsCount++
+		deal.Gift.NumRating = int(ratingScore)
+
+		// 4. ЛОГИКА АВТОПОКУПКИ (Hard Conditions)
+		// Покупаем ТОЛЬКО если: Черный фон ИЛИ Выгода > 25%
+		isBlack := deal.Gift.Attributes.Backdrop == "Black"
+		isSuperCheap := deal.Profit > 25.0
+
+		if isBlack || isSuperCheap {
+			// Запускаем покупку
+			go s.AutoBuy(ctx, *deal)
+
+			// Логируем причину покупки
+			logger(ctx).Info("🚀 Triggering AutoBuy",
+				"id", deal.Gift.ID,
+				"reason_black", isBlack,
+				"reason_cheap", isSuperCheap,
+				"profit", deal.Profit)
+		}
+
+		// 5. Сохраняем в историю БД (все интересные лоты, не только купленные)
 		if err := s.giftRepo.Create(ctx, deal.Gift); err != nil {
 			logger(ctx).Error("failed to save gift", "err", err)
-			continue
 		}
 
 		s.processedCache.Set(giftIDStr, true, cache.DefaultExpiration)
 
+		// Добавляем в возвращаемый слайс, чтобы пришло уведомление/лог
 		goodDeals = append(goodDeals, *deal)
+	}
+
+	if newDealsCount > 0 {
+		logger(ctx).Info("scan cycle stats", "type", giftType.Name, "new_items", newDealsCount, "found_gems", len(goodDeals))
 	}
 
 	return goodDeals, nil
 }
 
-// enrichAndEvaluate обогащает Deal бизнес-данными и возвращает true, если сделка выгодная.
-func (s *GiftService) enrichAndEvaluate(deal *entity.Deal, giftType entity.GiftType) bool {
-	benchmarkPrice := giftType.AveragePrice
-
-	// Нет данных для оценки
-	if benchmarkPrice <= 0 || deal.Gift.StarPrice <= 0 {
-		return false
-	}
-
-	// Цена не ниже средней — не интересно
-	if deal.Gift.StarPrice >= benchmarkPrice {
-		return false
-	}
-
-	// Считаем профит
-	profit := benchmarkPrice - deal.Gift.StarPrice
-	discountPercent := float64(profit) / float64(benchmarkPrice) * 100
-
-	// Не проходит порог
-	if discountPercent < s.minDiscountPercent {
-		return false
-	}
-
-	// Обогащаем Deal
+// analyzeDeal проверяет "мягкие" критерии для уведомлений.
+// Сюда попадают: обычные скидки (minDiscountPercent), красивые номера и редкие атрибуты.
+func (s *GiftService) analyzeDeal(deal *entity.Deal, giftType entity.GiftType) (bool, float64) {
 	deal.GiftType = &giftType
-	deal.AvgPrice = benchmarkPrice
-	deal.Profit = discountPercent
+	deal.AvgPrice = giftType.AveragePrice
 
-	return true
+	// --- КРИТЕРИЙ 1: ЦЕНА (Мягкий фильтр) ---
+	isGoodPrice := false
+	if giftType.AveragePrice > 0 && deal.Gift.StarPrice > 0 {
+		profit := giftType.AveragePrice - deal.Gift.StarPrice
+		deal.Profit = float64(profit) / float64(giftType.AveragePrice) * 100
+
+		// Используем стандартный конфиг (например, > 10% или 5%), чтобы просто уведомить
+		if deal.Profit >= s.minDiscountPercent {
+			isGoodPrice = true
+		}
+	}
+
+	// --- КРИТЕРИЙ 2: НОМЕР ---
+	rating := numRating.CalculateValue(deal.Gift.Num)
+	isGoodNumber := rating.Score > 60
+
+	// --- КРИТЕРИЙ 3: АТРИБУТЫ ---
+	isRareAttribute := deal.Gift.Attributes.Backdrop == "Black"
+
+	// Если хотя бы одно условие верно — возвращаем true (лот попадет в список и БД)
+	if isGoodPrice || isGoodNumber || isRareAttribute {
+		return true, rating.Score
+	}
+
+	return false, rating.Score
 }
 
 func (s *GiftService) GetGiftAveragePrice(ctx context.Context, giftTypeID int64) (int64, error) {
@@ -437,4 +469,27 @@ func (s *GiftService) ProcessGiftsByRating(ctx context.Context, giftTypeID int64
 		"min_rating_percent", minRatingPercent)
 
 	return processedCount, nil
+}
+
+// AutoBuy - проверяет условия и совершает покупку
+func (s *GiftService) AutoBuy(ctx context.Context, deal entity.Deal) {
+	log := logger(ctx).With("slug", deal.Gift.Slug, "num", deal.Gift.Num, "price_ton", deal.Gift.TonPrice)
+
+	// 1. Проверка баланса / бюджета (Hard Limit)
+	if deal.Gift.TonPrice > balance {
+		log.Warn("🚫 Skip buy: price exceeds budget", "budget", balance)
+		return
+	}
+
+	log.Info("⚡️ ATTEMPTING AUTO-BUY...")
+
+	// 2. Вызов клиента
+	err := s.tgClient.BuyDeal(ctx, deal)
+	if err != nil {
+		log.Error("❌ Auto-buy FAILED", "error", err)
+		// Тут можно отправить алерт "Не удалось купить"
+	} else {
+		log.Info("✅✅✅ AUTO-BUY SUCCESS! Check your wallet!")
+		// Тут можно отправить алерт "КУПЛЕНО!"
+	}
 }
