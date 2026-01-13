@@ -10,6 +10,7 @@ import (
 	"tg_market/internal/infrastructure/notifier"
 	"tg_market/internal/infrastructure/persistence"
 	"tg_market/internal/infrastructure/telegram"
+	"tg_market/internal/transport/bot"
 	"tg_market/internal/worker"
 	"tg_market/pkg/application/connectors"
 )
@@ -69,7 +70,7 @@ func Run(ctx context.Context, log *slog.Logger, cancel context.CancelFunc) error
 
 	// Notify bot
 
-	alertBot, err := notifier.NewTelegramBot(cfg.Bot.Token, cfg.Bot.ChatID)
+	alertBot, err := notifier.NewTelegramBot(cfg.Bot.Token, cfg.Bot.AdminID)
 	if err != nil {
 		return fmt.Errorf("notifier bot: %w", err)
 	}
@@ -91,37 +92,43 @@ func Run(ctx context.Context, log *slog.Logger, cancel context.CancelFunc) error
 	svc := service.NewGiftService(giftTypeRepo, giftRepo, pool).
 		WithDiscountThreshold(10)
 
+	log.Info("sync catalog")
+	_, err = svc.SyncCatalog(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Создаем и запускаем бота
+
 	targetTypes := []int64{
-		6012435906336654262,
-		5825480571261813595,
-		6005880141270483700,
-		5897581235231785485,
-		5870862540036113469,
-		5915502858152706668,
-		5821205665758053411,
-		5935936766358847989,
-		5981132629905245483,
-		5983471780763796287,
+		5882260270843168924,
+		5841632504448025405,
+		5856973938650776169,
 	}
 
 	scanner := worker.NewMarketScanner(svc, giftTypeRepo, dealsCh).
 		WithGiftTypes(targetTypes...).
 		WithRateControl(cfg.Telegram.GetRatePerClient()/2, pool.Size())
 
-	go func() {
-		defer close(dealsCh)
+	botInstance, err := bot.New(cfg, svc, scanner)
+	if err != nil {
+		return fmt.Errorf("failed to create bot: %w", err)
+	}
 
-		if err := scanner.Run(ctx); err != nil {
-			if ctx.Err() == nil {
-				log.Error("scanner died", "err", err)
-				cancel()
-			}
+	// Запускаем бота
+	go func() {
+		log.Info("starting telegram bot...")
+		if err := botInstance.Run(ctx); err != nil && ctx.Err() == nil {
+			log.Error("telegram bot stopped", "error", err)
+			cancel()
 		}
 	}()
 
-	log.Info("scanner started", "targets", targetTypes)
+	defer close(dealsCh)
 
 	<-ctx.Done()
+	
+	scanner.Stop()
 
 	log.Info("application stopping...")
 	return nil

@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS gift_types (
                                           market_floor_price BIGINT DEFAULT 0,    -- Минимальная цена сейчас
                                           market_quantity INT DEFAULT 0,          -- Количество лотов на продаже
                                           average_price   INT,
-                                          price_updated_at TIMESTAMP,
+                                          price_updated_at TIMESTAMP NOT NULL DEFAULT '1970-01-01 00:00:00',
                                           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 
 );

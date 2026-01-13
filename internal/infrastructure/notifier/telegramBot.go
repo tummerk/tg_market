@@ -6,6 +6,7 @@ import (
 	"os/exec" // <--- 1. Добавили для запуска команд
 	"runtime" // <--- 1. Добавили для определения ОС
 	"tg_market/internal/domain/entity"
+	"time"
 
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
@@ -30,18 +31,37 @@ func NewTelegramBot(token string, chatID int64) (*TelegramBot, error) {
 
 // Run запускает обработку сделок из канала.
 func (b *TelegramBot) Run(ctx context.Context, deals <-chan entity.Deal) error {
+	// Внешний цикл: читаем сделки из канала
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case deal, ok := <-deals:
 			if !ok {
-				return nil
+				return nil // Канал закрыт
 			}
-			if err := b.SendDeal(ctx, deal); err != nil {
-				// Логгер лучше передавать или инициализировать глобально,
-				// здесь оставил как было в примере
-				fmt.Printf("failed to send deal: %v\n", err)
+
+			// Внутренний цикл: "Retry forever"
+			// Мы не выйдем отсюда, пока не отправим сделку или не умрет контекст
+			for {
+				err := b.SendDeal(ctx, deal)
+				if err == nil {
+					// Успех! Выходим из внутреннего цикла (break),
+					// чтобы внешний цикл мог взять следующую сделку.
+					break
+				}
+
+				// Логируем ошибку
+				fmt.Printf("failed to send deal (retrying in 3s): %v\n", err)
+
+				// Пауза перед повторной попыткой.
+				// Используем select, чтобы не блокировать остановку программы.
+				select {
+				case <-ctx.Done():
+					return ctx.Err() // Программу остановили во время ожидания
+				case <-time.After(3 * time.Second):
+					// Прошло 3 секунды, идем на следующий круг внутреннего for
+				}
 			}
 		}
 	}

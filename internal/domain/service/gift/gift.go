@@ -4,19 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
-	"github.com/patrickmn/go-cache"
 	"tg_market/internal/domain"
 	"tg_market/internal/domain/entity"
 	"tg_market/internal/domain/service/numRating"
 	"tg_market/pkg/errcodes"
+
+	"github.com/patrickmn/go-cache"
 )
 
 const (
-	priceCacheTTL   = 5 * time.Minute
-	countToAvgPrice = 10
-	balance         = 13
+	priceCacheTTL             = 5 * time.Minute
+	countToAvgPrice           = 10
+	defaultMaxOffersToCheck   = 20
+	defaultMinDiscountPercent = 20.0
 )
 
 type TgClient interface {
@@ -48,11 +51,15 @@ type GiftRepository interface {
 }
 
 type GiftService struct {
-	giftTypeRepo       GiftTypeRepository
-	giftRepo           GiftRepository
-	tgClient           TgClient
+	giftTypeRepo GiftTypeRepository
+	giftRepo     GiftRepository
+	tgClient     TgClient
+
+	autoBuyEnabled     bool
+	balance            float64
 	minDiscountPercent float64
 	maxOffersToCheck   int
+	mu                 sync.RWMutex
 	processedCache     *cache.Cache
 }
 
@@ -65,9 +72,10 @@ func NewGiftService(
 		giftTypeRepo:       giftTypeRepo,
 		giftRepo:           giftRepo,
 		tgClient:           tgClient,
-		minDiscountPercent: 20.0,
-		maxOffersToCheck:   20,
+		minDiscountPercent: defaultMinDiscountPercent,
+		maxOffersToCheck:   defaultMaxOffersToCheck,
 		processedCache:     cache.New(time.Hour, priceCacheTTL),
+		autoBuyEnabled:     true,
 	}
 }
 
@@ -76,17 +84,21 @@ func (s *GiftService) WithDiscountThreshold(percent float64) *GiftService {
 	return s
 }
 
-func (s *GiftService) SyncCatalog(ctx context.Context) (SyncResult, error) {
+func (s *GiftService) SetDiscount(percent float64) {
+	s.minDiscountPercent = percent
+}
+
+func (s *GiftService) SyncCatalog(ctx context.Context) (domain.SyncResult, error) {
 	logger(ctx).Info("syncing catalog started")
 
 	remoteGifts, err := s.tgClient.GetGiftTypes(ctx, 0)
 	if err != nil {
-		return SyncResult{}, fmt.Errorf("fetch gift types: %w", err)
+		return domain.SyncResult{}, fmt.Errorf("fetch gift types: %w", err)
 	}
 
 	logger(ctx).Info("fetched gifts from TG", "count", len(remoteGifts))
 
-	var result SyncResult
+	var result domain.SyncResult
 
 	for _, remote := range remoteGifts {
 		created, err := s.syncGiftType(ctx, remote)
@@ -187,12 +199,10 @@ func (s *GiftService) CheckMarketForType(ctx context.Context, giftType entity.Gi
 		newDealsCount++
 		deal.Gift.NumRating = int(ratingScore)
 
-		// 4. ЛОГИКА АВТОПОКУПКИ (Hard Conditions)
-		// Покупаем ТОЛЬКО если: Черный фон ИЛИ Выгода > 25%
 		isBlack := deal.Gift.Attributes.Backdrop == "Black"
-		isSuperCheap := deal.Profit > 25.0
+		isSuperCheap := deal.Profit > 15.0
 
-		if isBlack || isSuperCheap {
+		if s.autoBuyEnabled && (isBlack || isSuperCheap) {
 			// Запускаем покупку
 			go s.AutoBuy(ctx, *deal)
 
@@ -407,8 +417,6 @@ func (s *GiftService) ProcessGiftsByRating(ctx context.Context, giftTypeID int64
 		for _, gift := range gifts {
 			// Вычисляем рейтинг для номера подарка
 			rating := numRating.CalculateValue(gift.Num)
-
-			// Проверяем, удовлетворяет ли рейтинг минимальному порогу
 			if rating.Score < minRatingPercent {
 				continue
 			}
@@ -471,25 +479,68 @@ func (s *GiftService) ProcessGiftsByRating(ctx context.Context, giftTypeID int64
 	return processedCount, nil
 }
 
-// AutoBuy - проверяет условия и совершает покупку
+// --- Обновленный метод AutoBuy ---
 func (s *GiftService) AutoBuy(ctx context.Context, deal entity.Deal) {
-	log := logger(ctx).With("slug", deal.Gift.Slug, "num", deal.Gift.Num, "price_ton", deal.Gift.TonPrice)
+	s.mu.RLock()
+	limit := s.balance
+	s.mu.RUnlock()
 
-	// 1. Проверка баланса / бюджета (Hard Limit)
-	if deal.Gift.TonPrice > balance {
-		log.Warn("🚫 Skip buy: price exceeds budget", "budget", balance)
+	if deal.Gift.TonPrice > limit {
 		return
 	}
 
-	log.Info("⚡️ ATTEMPTING AUTO-BUY...")
-
-	// 2. Вызов клиента
+	// Попытка покупки
 	err := s.tgClient.BuyDeal(ctx, deal)
 	if err != nil {
-		log.Error("❌ Auto-buy FAILED", "error", err)
-		// Тут можно отправить алерт "Не удалось купить"
-	} else {
-		log.Info("✅✅✅ AUTO-BUY SUCCESS! Check your wallet!")
-		// Тут можно отправить алерт "КУПЛЕНО!"
+
+		return
 	}
+
+	s.mu.Lock()
+	s.balance -= deal.Gift.TonPrice
+	s.mu.Unlock()
+}
+
+func (s *GiftService) SetAutoBuy() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.autoBuyEnabled = !s.autoBuyEnabled
+
+	return s.autoBuyEnabled
+}
+
+func (s *GiftService) IsAutoBuyEnabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.autoBuyEnabled
+}
+
+func (s *GiftService) SetBalance(amount float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.balance = amount
+}
+
+// ListGiftTypes возвращает список типов подарков
+func (s *GiftService) ListGiftTypes(ctx context.Context, limit, offset int) ([]entity.GiftType, error) {
+	return s.giftTypeRepo.List(ctx, limit, offset)
+}
+
+// GetGiftType возвращает тип подарка по ID
+func (s *GiftService) GetGiftType(ctx context.Context, id int64) (*entity.GiftType, error) {
+	return s.giftTypeRepo.GetByID(ctx, id)
+}
+
+// GetBalance возвращает текущий лимит баланса
+func (s *GiftService) GetBalance() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.balance
+}
+
+// GetDiscount возвращает текущий порог скидки
+func (s *GiftService) GetDiscount() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.minDiscountPercent
 }

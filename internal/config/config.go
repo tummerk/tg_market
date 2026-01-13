@@ -2,9 +2,10 @@ package config
 
 import (
 	"fmt"
+	"strings"
+
 	"github.com/caarlos0/env/v10"
 	"github.com/joho/godotenv"
-	"strings"
 )
 
 type Config struct {
@@ -14,8 +15,8 @@ type Config struct {
 }
 
 type Bot struct {
-	Token  string `env:"BOT_TOKEN,required"`
-	ChatID int64  `env:"BOT_CHAT_ID,required"`
+	Token   string `env:"BOT_TOKEN,required"`
+	AdminID int64  `env:"BOT_ADMIN_ID,required"`
 }
 
 func Load() (Config, error) {

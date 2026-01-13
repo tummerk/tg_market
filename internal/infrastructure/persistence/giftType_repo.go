@@ -165,7 +165,7 @@ func (r *GiftTypeRepository) DecreaseSupply(ctx context.Context, id int64) error
 }
 
 func (r *GiftTypeRepository) List(ctx context.Context, limit, offset int) ([]entity.GiftType, error) {
-	query := `SELECT * FROM gift_types ORDER BY id ASC LIMIT $1 OFFSET $2`
+	query := `SELECT * FROM gift_types ORDER BY average_price desc LIMIT $1 OFFSET $2`
 
 	var schemas []GiftTypeSchema
 	if err := r.db.SelectContext(ctx, &schemas, query, limit, offset); err != nil {
